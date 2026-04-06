@@ -32,6 +32,8 @@ BTN_DONE     = "✅ 完成選擇"
 BTN_UNDO     = "🗑️ 清除上一個"
 BTN_BACK     = "↩️ 返回上一步"
 BTN_CANCEL   = "❌ 取消本次動作"
+BTN_SKIP     = "⏭️ 略過"
+BTN_CONFIRM  = "✅ 確認儲存"
 BTN_ADD_COUNTY   = "➕ 新增縣市"
 BTN_ADD_DISTRICT = "➕ 新增市區"
 BTN_ADD_TYPE     = "➕ 新增種類"
@@ -115,11 +117,9 @@ def save_to_notion(data: dict) -> bool:
         properties["縣市"] = {"select": {"name": data["縣市"]}}
     if data.get("市區"):
         properties["市區"] = {"select": {"name": data["市區"]}}
-
     link = data.get("連結", "")
     if link:
         properties["Name"]["title"][0]["text"]["link"] = {"url": link}
-
     body = {"parent": {"database_id": NOTION_DB_ID}, "properties": properties}
     try:
         resp = requests.post(url, headers=NOTION_HEADERS, json=body, timeout=10)
@@ -133,57 +133,98 @@ def save_to_notion(data: dict) -> bool:
         logger.error(f"save_to_notion 錯誤: {e}")
         return False
 
-# ── 鍵盤產生器 ────────────────────────────────────────────
-def make_keyboard(options: list, cols: int = 2) -> ReplyKeyboardMarkup:
-    rows = [options[i:i+cols] for i in range(0, len(options), cols)]
+# ══════════════════════════════════════════════════════════
+# 鍵盤產生器
+# ══════════════════════════════════════════════════════════
+
+def _opts_rows(opts: list) -> list:
+    """
+    每排兩個選項。
+    若最後為單數，補一個空字串湊成兩格，保持排版整齊。
+    """
+    padded = opts[:]
+    if len(padded) % 2 != 0:
+        padded.append("")          # 補空位，視覺上保持對齊
+    rows = []
+    for i in range(0, len(padded), 2):
+        pair = padded[i:i+2]
+        # 過濾掉全空的排（理論上不會，但防呆）
+        rows.append(pair)
+    return rows
+
+def name_keyboard() -> ReplyKeyboardMarkup:
+    """
+    [ ⏭️ 略過 ]  [ ❌ 取消本次動作 ]
+    """
+    rows = [[BTN_SKIP, BTN_CANCEL]]
     return ReplyKeyboardMarkup(rows, one_time_keyboard=True, resize_keyboard=True)
 
 def county_keyboard(county_opts: list) -> ReplyKeyboardMarkup:
     """
-    單選欄位鍵盤：
-    最上方：↩️ 返回上一步（整排）
-    中間：  各縣市選項
-    最下方：➕ 新增縣市 ／ ❌ 取消本次動作
+    [ ↩️ 返回上一步 ]（整排）
+    各縣市選項（每排2個）
+    [ ➕ 新增縣市 ]（整排）
+    [ ❌ 取消本次動作 ]（整排）
     """
-    rows = []
-    rows.append([BTN_BACK])
-    opts = county_opts if county_opts else []
-    for i in range(0, len(opts), 2):
-        rows.append(opts[i:i+2])
-    rows.append([BTN_ADD_COUNTY, BTN_CANCEL])
+    rows = [[BTN_BACK]]
+    rows += _opts_rows(county_opts)
+    rows.append([BTN_ADD_COUNTY])
+    rows.append([BTN_CANCEL])
     return ReplyKeyboardMarkup(rows, one_time_keyboard=True, resize_keyboard=True)
 
 def district_keyboard(district_opts: list) -> ReplyKeyboardMarkup:
     """
-    單選欄位鍵盤：
-    最上方：↩️ 返回上一步
-    中間：  各市區選項
-    最下方：➕ 新增市區 ／ ❌ 取消本次動作
+    [ ↩️ 返回上一步 ]（整排）
+    各市區選項（每排2個）
+    [ ➕ 新增市區 ]（整排）
+    [ ❌ 取消本次動作 ]（整排）
     """
-    rows = []
-    rows.append([BTN_BACK])
-    opts = district_opts if district_opts else []
-    for i in range(0, len(opts), 2):
-        rows.append(opts[i:i+2])
-    rows.append([BTN_ADD_DISTRICT, BTN_CANCEL])
+    rows = [[BTN_BACK]]
+    rows += _opts_rows(district_opts)
+    rows.append([BTN_ADD_DISTRICT])
+    rows.append([BTN_CANCEL])
     return ReplyKeyboardMarkup(rows, one_time_keyboard=True, resize_keyboard=True)
 
 def type_keyboard(type_opts: list, has_selection: bool) -> ReplyKeyboardMarkup:
     """
-    多選欄位鍵盤：
-    最上方：🗑️ 清除上一個  ↩️ 返回上一步（並排，清除在左）
-    　　　　✅ 完成選擇（整排，只有已選至少一個時顯示）
-    中間：  各種類選項
-    最下方：➕ 新增種類 ／ ❌ 取消本次動作
+    有已選項目時：
+      [ ✅ 完成選擇 ]（整排，最上方）
+      [ 🗑️ 清除上一個 ]  [ ↩️ 返回上一步 ]
+    無已選項目時：
+      [ 🗑️ 清除上一個 ]  [ ↩️ 返回上一步 ]
+    各種類選項（每排2個，單數補空位）
+    [ ➕ 新增種類 ]（整排）
+    [ ❌ 取消本次動作 ]（整排）
     """
     rows = []
-    rows.append([BTN_UNDO, BTN_BACK])
     if has_selection:
-        rows.append([BTN_DONE])
-    opts = type_opts if type_opts else []
-    for i in range(0, len(opts), 2):
-        rows.append(opts[i:i+2])
-    rows.append([BTN_ADD_TYPE, BTN_CANCEL])
+        rows.append([BTN_DONE])          # 完成選擇獨佔整排，最上方
+    rows.append([BTN_UNDO, BTN_BACK])    # 清除在左，返回在右
+    rows += _opts_rows(type_opts)
+    rows.append([BTN_ADD_TYPE])
+    rows.append([BTN_CANCEL])
+    return ReplyKeyboardMarkup(rows, one_time_keyboard=True, resize_keyboard=True)
+
+def text_input_keyboard() -> ReplyKeyboardMarkup:
+    """
+    [ ⏭️ 略過 ]（整排）
+    [ ↩️ 返回上一步 ]  [ ❌ 取消本次動作 ]
+    """
+    rows = [
+        [BTN_SKIP],
+        [BTN_BACK, BTN_CANCEL],
+    ]
+    return ReplyKeyboardMarkup(rows, one_time_keyboard=True, resize_keyboard=True)
+
+def confirm_keyboard() -> ReplyKeyboardMarkup:
+    """
+    [ ✅ 確認儲存 ]（整排）
+    [ ↩️ 返回上一步 ]  [ ❌ 取消本次動作 ]
+    """
+    rows = [
+        [BTN_CONFIRM],
+        [BTN_BACK, BTN_CANCEL],
+    ]
     return ReplyKeyboardMarkup(rows, one_time_keyboard=True, resize_keyboard=True)
 
 # ── 判斷是否為網址 ─────────────────────────────────────────
@@ -213,7 +254,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def receive_url_direct(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """偵測到網址，自動啟動流程"""
+    """偵測到網址，自動啟動流程（不需要 /start）"""
     context.user_data.clear()
     text = update.message.text.strip()
     context.user_data["連結"] = text
@@ -224,13 +265,18 @@ async def receive_url_direct(update: Update, context: ContextTypes.DEFAULT_TYPE)
             context.user_data["名稱"] = title
             await update.message.reply_text(
                 f"偵測到 YouTube！已自動抓取標題：{title}\n\n"
-                "若想修改名稱請輸入新名稱，否則輸入「略過」繼續："
+                "若想修改名稱請輸入新名稱，否則點「略過」繼續：",
+                reply_markup=name_keyboard()
             )
         else:
-            await update.message.reply_text("偵測到 YouTube 連結，請輸入餐廳名稱：")
+            await update.message.reply_text(
+                "偵測到 YouTube 連結，請輸入餐廳名稱，或點「略過」：",
+                reply_markup=name_keyboard()
+            )
     else:
         await update.message.reply_text(
-            "已收到連結！\n請輸入餐廳名稱（若無請輸入「略過」）："
+            "已收到連結！\n請輸入餐廳名稱，或點「略過」繼續：",
+            reply_markup=name_keyboard()
         )
     return ASK_NAME
 
@@ -247,15 +293,18 @@ async def ask_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
             title = get_youtube_title(text)
             if title:
                 context.user_data["名稱"] = title
-        await update.message.reply_text("已記錄連結！\n請輸入餐廳名稱（若無請輸入「略過」）：")
+        await update.message.reply_text(
+            "已記錄連結！\n請輸入餐廳名稱，或點「略過」繼續：",
+            reply_markup=name_keyboard()
+        )
         return ASK_NAME
 
-    if text != "略過":
+    if text in (BTN_SKIP, "略過"):
+        if not context.user_data.get("名稱"):
+            context.user_data["名稱"] = "未命名"
+    else:
         context.user_data["名稱"] = text
-    elif not context.user_data.get("名稱"):
-        context.user_data["名稱"] = "未命名"
 
-    # 讀取 Notion 選項
     county_opts, district_opts, type_opts = fetch_notion_options()
     context.user_data["_county_opts"]   = county_opts
     context.user_data["_district_opts"] = district_opts
@@ -276,8 +325,8 @@ async def ask_county(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await do_cancel(update, context)
     if text == BTN_BACK:
         await update.message.reply_text(
-            "請重新輸入餐廳名稱：",
-            reply_markup=ReplyKeyboardRemove()
+            "請重新輸入餐廳名稱，或點「略過」：",
+            reply_markup=name_keyboard()
         )
         return ASK_NAME
     if text == BTN_ADD_COUNTY:
@@ -347,9 +396,9 @@ async def _go_to_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def ask_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
-    type_opts = context.user_data.get("_type_opts", [])
+    type_opts     = context.user_data.get("_type_opts", [])
     district_opts = context.user_data.get("_district_opts", [])
-    selected = context.user_data.get("種類", [])
+    selected      = context.user_data.get("種類", [])
 
     if text == BTN_CANCEL:
         return await do_cancel(update, context)
@@ -385,14 +434,22 @@ async def ask_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return ASK_TYPE
         await update.message.reply_text(
-            "請輸入營業時間\n（例如：11:30-21:00，週二公休）\n不清楚請輸入「略過」：",
-            reply_markup=ReplyKeyboardRemove()
+            "請輸入營業時間\n（例如：11:30-21:00，週二公休）",
+            reply_markup=text_input_keyboard()
         )
         return ASK_HOURS
 
     if text == BTN_ADD_TYPE:
         await update.message.reply_text("請輸入新的種類名稱：", reply_markup=ReplyKeyboardRemove())
         return ASK_TYPE_NEW
+
+    if text == "":
+        # 空字串是補位用的，忽略
+        await update.message.reply_text(
+            "請選擇一個選項：",
+            reply_markup=type_keyboard(type_opts, has_selection=bool(selected))
+        )
+        return ASK_TYPE
 
     if text in type_opts:
         if text not in selected:
@@ -408,8 +465,8 @@ async def ask_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 手動輸入（逗號分隔）
     context.user_data["種類"] = [t.strip() for t in text.split(",") if t.strip()]
     await update.message.reply_text(
-        "請輸入營業時間\n（例如：11:30-21:00，週二公休）\n不清楚請輸入「略過」：",
-        reply_markup=ReplyKeyboardRemove()
+        "請輸入營業時間\n（例如：11:30-21:00，週二公休）",
+        reply_markup=text_input_keyboard()
     )
     return ASK_HOURS
 
@@ -419,7 +476,7 @@ async def ask_type_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == BTN_CANCEL:
         return await do_cancel(update, context)
     type_opts = context.user_data.get("_type_opts", [])
-    selected = context.user_data.get("種類", [])
+    selected  = context.user_data.get("種類", [])
     if text and text not in selected:
         selected.append(text)
         context.user_data["種類"] = selected
@@ -437,16 +494,16 @@ async def ask_hours(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await do_cancel(update, context)
     if text == BTN_BACK:
         type_opts = context.user_data.get("_type_opts", [])
-        selected = context.user_data.get("種類", [])
+        selected  = context.user_data.get("種類", [])
         await update.message.reply_text(
             "請重新選擇料理種類：",
             reply_markup=type_keyboard(type_opts, has_selection=bool(selected))
         )
         return ASK_TYPE
-    context.user_data["營業時間"] = "" if text == "略過" else text
+    context.user_data["營業時間"] = "" if text in (BTN_SKIP, "略過") else text
     await update.message.reply_text(
-        "請輸入餐廳特色\n（例如：老宅改造、必點牛舌定食）\n沒有請輸入「略過」：",
-        reply_markup=make_keyboard([BTN_BACK, BTN_CANCEL])
+        "請輸入餐廳特色\n（例如：老宅改造、必點牛舌定食）",
+        reply_markup=text_input_keyboard()
     )
     return ASK_FEATURE
 
@@ -457,14 +514,14 @@ async def ask_feature(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await do_cancel(update, context)
     if text == BTN_BACK:
         await update.message.reply_text(
-            "請重新輸入營業時間（不清楚請輸入「略過」）：",
-            reply_markup=make_keyboard([BTN_BACK, BTN_CANCEL])
+            "請重新輸入營業時間：",
+            reply_markup=text_input_keyboard()
         )
         return ASK_HOURS
-    context.user_data["特色"] = "" if text == "略過" else text
+    context.user_data["特色"] = "" if text in (BTN_SKIP, "略過") else text
     await update.message.reply_text(
-        "請輸入你的評價或備忘\n（例如：強烈推薦！下次還要去）\n沒有請輸入「略過」：",
-        reply_markup=make_keyboard([BTN_BACK, BTN_CANCEL])
+        "請輸入你的評價或備忘\n（例如：強烈推薦！下次還要去）",
+        reply_markup=text_input_keyboard()
     )
     return ASK_RATING
 
@@ -475,18 +532,18 @@ async def ask_rating(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await do_cancel(update, context)
     if text == BTN_BACK:
         await update.message.reply_text(
-            "請重新輸入餐廳特色（沒有請輸入「略過」）：",
-            reply_markup=make_keyboard([BTN_BACK, BTN_CANCEL])
+            "請重新輸入餐廳特色：",
+            reply_markup=text_input_keyboard()
         )
         return ASK_FEATURE
-    context.user_data["評價"] = "" if text == "略過" else text
+    context.user_data["評價"] = "" if text in (BTN_SKIP, "略過") else text
 
     if context.user_data.get("連結"):
         return await _show_confirm(update, context)
 
     await update.message.reply_text(
-        "請貼上相關連結\n（Google Maps / 食記 / YouTube 皆可）\n沒有請輸入「略過」：",
-        reply_markup=make_keyboard([BTN_BACK, BTN_CANCEL])
+        "請貼上相關連結\n（Google Maps / 食記 / YouTube 皆可）",
+        reply_markup=text_input_keyboard()
     )
     return ASK_URL
 
@@ -497,11 +554,11 @@ async def ask_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await do_cancel(update, context)
     if text == BTN_BACK:
         await update.message.reply_text(
-            "請重新輸入評價（沒有請輸入「略過」）：",
-            reply_markup=make_keyboard([BTN_BACK, BTN_CANCEL])
+            "請重新輸入評價：",
+            reply_markup=text_input_keyboard()
         )
         return ASK_RATING
-    context.user_data["連結"] = "" if text == "略過" else text
+    context.user_data["連結"] = "" if text in (BTN_SKIP, "略過") else text
     return await _show_confirm(update, context)
 
 
@@ -520,7 +577,7 @@ async def _show_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(
         summary,
-        reply_markup=make_keyboard(["確認儲存", BTN_BACK, BTN_CANCEL])
+        reply_markup=confirm_keyboard()
     )
     return CONFIRM
 
@@ -530,22 +587,22 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text == BTN_CANCEL:
         return await do_cancel(update, context)
+
     if text == BTN_BACK:
-        # 返回評價或連結步驟
         if context.user_data.get("連結"):
             await update.message.reply_text(
-                "請重新輸入評價（沒有請輸入「略過」）：",
-                reply_markup=make_keyboard([BTN_BACK, BTN_CANCEL])
+                "請重新輸入評價：",
+                reply_markup=text_input_keyboard()
             )
             return ASK_RATING
         else:
             await update.message.reply_text(
-                "請重新輸入連結（沒有請輸入「略過」）：",
-                reply_markup=make_keyboard([BTN_BACK, BTN_CANCEL])
+                "請重新輸入連結：",
+                reply_markup=text_input_keyboard()
             )
             return ASK_URL
 
-    if "確認" in text:
+    if text == BTN_CONFIRM:
         ok = save_to_notion(context.user_data)
         if ok:
             await update.message.reply_text(
@@ -560,7 +617,10 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         return ConversationHandler.END
 
-    await update.message.reply_text("請點選「確認儲存」或「↩️ 返回上一步」。")
+    await update.message.reply_text(
+        "請點選上方按鈕操作。",
+        reply_markup=confirm_keyboard()
+    )
     return CONFIRM
 
 
