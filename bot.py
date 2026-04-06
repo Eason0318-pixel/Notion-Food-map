@@ -123,12 +123,22 @@ def analyze_image_with_gemini(image_bytes: bytes) -> str:
                         }
                     },
                     {
+                    {
                         "text": (
-                            "這是一張餐廳貼文的截圖。"
-                            "請從圖片中辨識餐廳名稱，只回傳餐廳名稱本身，"
-                            "不要加任何說明文字。"
-                            "如果無法辨識餐廳名稱，只回傳「無法辨識」。"
+                            "這是一張來自 Instagram 或 Threads 的餐廳美食貼文截圖。"
+                            "請仔細分析圖片中的所有文字內容，找出所有可能的餐廳名稱。"
+                            "餐廳名稱可能出現在以下位置，請逐一檢查：\n"
+                            "1. 貼文內文中被引號、書名號、括號標示的文字\n"
+                            "2. hashtag 中（例如 #參佰碗、#一蘭拉麵）\n"
+                            "3. 貼文開頭或結尾的店名標示\n"
+                            "4. 圖片上的店招牌、Logo 文字\n"
+                            "5. 內文中明顯像是店名的專有名詞\n"
+                            "請回傳最多 3 個最可能是餐廳名稱的候選，"
+                            "每個名稱單獨一行，不要加編號、符號或任何說明文字。"
+                            "如果只找到一個，就只回傳一個。"
+                            "如果完全無法判斷，只回傳「無法辨識」。"
                         )
+                    }
                     }
                 ]
             }]
@@ -136,16 +146,18 @@ def analyze_image_with_gemini(image_bytes: bytes) -> str:
         resp = requests.post(url, json=payload, timeout=15)
         if resp.status_code == 200:
             result = resp.json()
-            name = result["candidates"][0]["content"]["parts"][0]["text"].strip()
-            if name == "無法辨識":
-                return ""
-            return name
+            raw = result["candidates"][0]["content"]["parts"][0]["text"].strip()
+            if raw == "無法辨識":
+                return []
+            # 每行一個候選名稱，過濾空行，最多取 3 個
+            candidates = [line.strip() for line in raw.splitlines() if line.strip()][:3]
+            return candidates
         else:
             logger.error(f"Gemini API 錯誤: {resp.text}")
-            return ""
+            return []
     except Exception as e:
         logger.error(f"analyze_image_with_gemini 錯誤: {e}")
-        return ""
+        return []
 
 # ── 寫入 Notion ────────────────────────────────────────────
 def save_to_notion(data: dict) -> bool:
@@ -378,15 +390,24 @@ async def ask_name_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file = await photo.get_file()
     image_bytes = await file.download_as_bytearray()
 
-    suggested_name = analyze_image_with_gemini(bytes(image_bytes))
+    candidates = analyze_image_with_gemini(bytes(image_bytes))
 
-    if suggested_name:
-        context.user_data["_gemini_suggestion"] = suggested_name
-        await update.message.reply_text(
-            f"AI 辨識結果：\n\n「{suggested_name}」\n\n"
-            "點「✅ 確認儲存」使用此名稱，或直接輸入修改後的名稱：",
-            reply_markup=name_confirm_keyboard()
-        )
+    if candidates:
+        context.user_data["_gemini_candidates"] = candidates
+
+        if len(candidates) == 1:
+            # 只有一個候選，直接顯示確認
+            msg = f"AI 辨識結果：\n\n「{candidates[0]}」\n\n點選使用此名稱，或直接輸入修改後的名稱："
+        else:
+            # 多個候選，列出讓使用者選
+            msg = "AI 找到以下可能的餐廳名稱，請點選或直接輸入修改後的名稱："
+
+        # 把每個候選做成按鈕，最下方加略過和取消
+        rows = [[c] for c in candidates]
+        rows.append([BTN_SKIP, BTN_CANCEL])
+        keyboard = ReplyKeyboardMarkup(rows, one_time_keyboard=True, resize_keyboard=True)
+
+        await update.message.reply_text(msg, reply_markup=keyboard)
         return ASK_NAME_CONFIRM
     else:
         await update.message.reply_text(
@@ -403,11 +424,18 @@ async def ask_name_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == BTN_CANCEL:
         return await do_cancel(update, context)
 
-    if text == BTN_CONFIRM:
-        # 使用 Gemini 建議的名稱
-        context.user_data["名稱"] = context.user_data.get("_gemini_suggestion", "未命名")
+    candidates = context.user_data.get("_gemini_candidates", [])
+
+    if text == BTN_CANCEL:
+        return await do_cancel(update, context)
     elif text in (BTN_SKIP, "略過"):
         context.user_data["名稱"] = "未命名"
+    elif text in candidates:
+        # 使用者點選了某個候選名稱
+        context.user_data["名稱"] = text
+    elif text == BTN_CONFIRM and candidates:
+        # 相容舊的單一確認按鈕（只有一個候選時）
+        context.user_data["名稱"] = candidates[0]
     else:
         # 使用者手動輸入修改後的名稱
         context.user_data["名稱"] = text
