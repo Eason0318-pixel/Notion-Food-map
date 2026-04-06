@@ -137,19 +137,19 @@ def save_to_notion(data: dict) -> bool:
 # 鍵盤產生器
 # ══════════════════════════════════════════════════════════
 
+PLACEHOLDER = "（待新增）"
+
 def _opts_rows(opts: list) -> list:
     """
     每排兩個選項。
-    若最後為單數，補一個空字串湊成兩格，保持排版整齊。
+    若最後為單數，補「（待新增）」佔位，保持排版整齊。
     """
     padded = opts[:]
     if len(padded) % 2 != 0:
-        padded.append("")          # 補空位，視覺上保持對齊
+        padded.append(PLACEHOLDER)
     rows = []
     for i in range(0, len(padded), 2):
-        pair = padded[i:i+2]
-        # 過濾掉全空的排（理論上不會，但防呆）
-        rows.append(pair)
+        rows.append(padded[i:i+2])
     return rows
 
 def name_keyboard() -> ReplyKeyboardMarkup:
@@ -443,8 +443,8 @@ async def ask_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("請輸入新的種類名稱：", reply_markup=ReplyKeyboardRemove())
         return ASK_TYPE_NEW
 
-    if text == "":
-        # 空字串是補位用的，忽略
+    if text == PLACEHOLDER:
+        # 佔位按鈕，點了忽略
         await update.message.reply_text(
             "請選擇一個選項：",
             reply_markup=type_keyboard(type_opts, has_selection=bool(selected))
@@ -480,6 +480,10 @@ async def ask_type_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text and text not in selected:
         selected.append(text)
         context.user_data["種類"] = selected
+    # 同步把新選項加進 _type_opts，讓（待新增）補位自動消失
+    if text and text not in type_opts:
+        type_opts.append(text)
+        context.user_data["_type_opts"] = type_opts
     already = "、".join(selected)
     await update.message.reply_text(
         f"已新增種類：{text}\n目前已選：{already}",
