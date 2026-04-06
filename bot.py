@@ -42,7 +42,6 @@ NOTION_HEADERS = {
 
 # ── 動態讀取 Notion 選項 ───────────────────────────────────
 def fetch_notion_options():
-    """從 Notion 動態讀取最新的 select / multi_select 選項"""
     url = f"https://api.notion.com/v1/databases/{NOTION_DB_ID}"
     try:
         resp = requests.get(url, headers=NOTION_HEADERS, timeout=10)
@@ -102,13 +101,11 @@ def save_to_notion(data: dict) -> bool:
         },
     }
 
-    # select 欄位只在有值時才加入（避免傳空字串出錯）
     if data.get("縣市"):
         properties["縣市"] = {"select": {"name": data["縣市"]}}
     if data.get("市區"):
         properties["市區"] = {"select": {"name": data["市區"]}}
 
-    # 若有連結，加在標題的 link 上
     link = data.get("連結", "")
     if link:
         properties["Name"]["title"][0]["text"]["link"] = {"url": link}
@@ -152,7 +149,6 @@ async def ask_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.message.text.strip()
     context.user_data["名稱"] = name
 
-    # 一次讀取所有 Notion 選項
     county_opts, district_opts, type_opts = fetch_notion_options()
     context.user_data["_county_opts"]   = county_opts
     context.user_data["_district_opts"] = district_opts
@@ -217,7 +213,6 @@ async def ask_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=make_keyboard(["完成"] + type_opts)
             )
             return ASK_TYPE
-        # 進入下一步
     elif text in type_opts:
         if text not in context.user_data["種類"]:
             context.user_data["種類"].append(text)
@@ -228,7 +223,6 @@ async def ask_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ASK_TYPE
     else:
-        # 手動輸入（逗號分隔）
         context.user_data["種類"] = [t.strip() for t in text.split(",") if t.strip()]
 
     await update.message.reply_text(
