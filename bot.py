@@ -60,6 +60,21 @@ PLACEHOLDER      = "（待新增）"
     CONFIRM,
 ) = range(14)
 
+# ── 縣市與市區對應表（新增市區時會動態更新） ──────────────────
+# 格式：{ "市區名稱": "所屬縣市" }
+DISTRICT_COUNTY_MAP = {
+    "中西區": "台南",
+    "東區":   "台南",
+    "永康區": "台南",
+    "南區":   "台南",
+    "北區":   "台南",
+    "三民區": "高雄",
+}
+
+def get_districts_for_county(county: str) -> list:
+    """根據已選縣市，過濾出對應的市區清單"""
+    return [d for d, c in DISTRICT_COUNTY_MAP.items() if c == county]
+
 # ── 動態讀取 Notion 選項 ───────────────────────────────────
 def fetch_notion_options():
     url = f"https://api.notion.com/v1/databases/{NOTION_DB_ID}"
@@ -124,20 +139,24 @@ def analyze_image_with_gemini(image_bytes: bytes) -> str:
                     },
                     {
                     {
+                    {
                         "text": (
                             "這是一張來自 Instagram 或 Threads 的餐廳美食貼文截圖。"
-                            "請仔細分析圖片中的所有文字內容，找出所有可能的餐廳名稱。"
-                            "餐廳名稱可能出現在以下位置，請逐一檢查：\n"
-                            "1. 貼文內文中被引號、書名號、括號標示的文字\n"
-                            "2. hashtag 中（例如 #參佰碗、#一蘭拉麵）\n"
-                            "3. 貼文開頭或結尾的店名標示\n"
-                            "4. 圖片上的店招牌、Logo 文字\n"
-                            "5. 內文中明顯像是店名的專有名詞\n"
+                            "請仔細分析圖片中所有文字，找出餐廳店名。\n"
+                            "店名最常出現在以下位置，請依序優先檢查：\n"
+                            "1. 內文開頭用《》、<<>>、【】、「」、''包住的文字（例如：<<小泰菜 Small Thai>>）\n"
+                            "2. 貼文下方的地標／打卡位置圖示旁的文字（📍後面的店名）\n"
+                            "3. hashtag 中出現的店名（去掉#號，例如：#小泰菜 → 小泰菜）\n"
+                            "4. 內文中明顯是中文店名或中英文混合店名的專有名詞\n"
+                            "5. 圖片上的招牌或 Logo 文字\n"
+                            "6. IG 帳號名稱（通常與店名相關，可作為參考）\n"
+                            "如果同一個店名在中文和英文都有出現，優先回傳中文名稱。"
                             "請回傳最多 3 個最可能是餐廳名稱的候選，"
                             "每個名稱單獨一行，不要加編號、符號或任何說明文字。"
                             "如果只找到一個，就只回傳一個。"
                             "如果完全無法判斷，只回傳「無法辨識」。"
                         )
+                    }
                     }
                     }
                 ]
@@ -284,10 +303,10 @@ async def do_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _load_notion_and_go_county(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """讀取 Notion 選項後跳往縣市選擇"""
-    county_opts, district_opts, type_opts = fetch_notion_options()
-    context.user_data["_county_opts"]   = county_opts
-    context.user_data["_district_opts"] = district_opts
-    context.user_data["_type_opts"]     = type_opts
+    county_opts, _, type_opts = fetch_notion_options()
+    context.user_data["_county_opts"] = county_opts
+    context.user_data["_type_opts"]   = type_opts
+    # 市區清單不從 Notion 讀，改由對應表動態產生（選完縣市後才決定）
     name = context.user_data.get("名稱", "未命名")
     await update.message.reply_text(
         f"已記錄：{name}\n\n請選擇縣市：",
@@ -459,6 +478,8 @@ async def ask_county(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ASK_COUNTY_NEW
 
     context.user_data["縣市"] = text
+    # 根據選擇的縣市，過濾對應的市區清單
+    context.user_data["_district_opts"] = get_districts_for_county(text)
     return await _go_to_district(update, context)
 
 
@@ -467,6 +488,7 @@ async def ask_county_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == BTN_CANCEL:
         return await do_cancel(update, context)
     context.user_data["縣市"] = text
+    context.user_data["_district_opts"] = get_districts_for_county(text)
     await update.message.reply_text(f"已新增縣市：{text}")
     return await _go_to_district(update, context)
 
@@ -505,7 +527,13 @@ async def ask_district_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == BTN_CANCEL:
         return await do_cancel(update, context)
     context.user_data["市區"] = text
-    await update.message.reply_text(f"已新增市區：{text}")
+    # 把新市區記錄到對應表，綁定到目前選擇的縣市
+    county = context.user_data.get("縣市", "")
+    if text and county:
+        DISTRICT_COUNTY_MAP[text] = county
+        # 同步更新 _district_opts，讓返回上一步時也能看到新選項
+        context.user_data["_district_opts"] = get_districts_for_county(county)
+    await update.message.reply_text(f"已新增市區：{text}（已歸類到 {county}）")
     return await _go_to_type(update, context)
 
 
