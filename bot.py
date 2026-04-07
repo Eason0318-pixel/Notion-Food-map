@@ -115,14 +115,25 @@ def get_youtube_title(url: str) -> str:
     return ""
 
 # ── Gemini Vision 圖片辨識 ────────────────────────────────
-def analyze_image_with_gemini(image_bytes: bytes) -> str:
+def detect_mime_type(image_bytes: bytes) -> str:
+    """自動偵測圖片格式，避免格式標註錯誤導致辨識失敗"""
+    if image_bytes[:8] == b'\x89PNG\r\n\x1a\n':
+        return "image/png"
+    elif image_bytes[:3] == b'\xff\xd8\xff':
+        return "image/jpeg"
+    elif image_bytes[:4] == b'RIFF' and image_bytes[8:12] == b'WEBP':
+        return "image/webp"
+    return "image/jpeg"  # 預設
+
+def analyze_image_with_gemini(image_bytes: bytes) -> list:
     """
     將圖片傳給 Gemini Vision，請它從截圖中辨識餐廳名稱。
-    回傳建議的餐廳名稱字串，失敗則回傳空字串。
+    回傳建議的餐廳名稱清單，失敗則回傳空清單。
     """
     if not GEMINI_API_KEY:
-        return ""
+        return []
     try:
+        mime_type = detect_mime_type(image_bytes)
         image_b64 = base64.b64encode(image_bytes).decode("utf-8")
         url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -133,7 +144,7 @@ def analyze_image_with_gemini(image_bytes: bytes) -> str:
                 "parts": [
                     {
                         "inline_data": {
-                            "mime_type": "image/jpeg",
+                            "mime_type": mime_type,
                             "data": image_b64
                         }
                     },
