@@ -149,8 +149,6 @@ def analyze_image_with_gemini(image_bytes: bytes) -> list:
                         }
                     },
                     {
-                    {
-                    {
                         "text": (
                             "這是一張來自 Instagram 或 Threads 的餐廳美食貼文截圖。"
                             "請仔細分析圖片中所有文字，找出餐廳店名。\n"
@@ -167,8 +165,6 @@ def analyze_image_with_gemini(image_bytes: bytes) -> list:
                             "如果只找到一個，就只回傳一個。"
                             "如果完全無法判斷，只回傳「無法辨識」。"
                         )
-                    }
-                    }
                     }
                 ]
             }]
