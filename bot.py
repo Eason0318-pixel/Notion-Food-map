@@ -173,17 +173,18 @@ def analyze_image_with_gemini(image_bytes: bytes) -> list:
         if resp.status_code == 200:
             result = resp.json()
             raw = result["candidates"][0]["content"]["parts"][0]["text"].strip()
+            logger.info(f"Gemini 回傳原始內容: {raw}")
             if raw == "無法辨識":
                 return []
-            # 每行一個候選名稱，過濾空行，最多取 3 個
             candidates = [line.strip() for line in raw.splitlines() if line.strip()][:3]
             return candidates
         else:
-            logger.error(f"Gemini API 錯誤: {resp.text}")
-            return []
+            # 回傳錯誤碼和詳細訊息，方便除錯
+            logger.error(f"Gemini API 錯誤 {resp.status_code}: {resp.text}")
+            return [f"[除錯] API錯誤 {resp.status_code}: {resp.text[:100]}"]
     except Exception as e:
         logger.error(f"analyze_image_with_gemini 錯誤: {e}")
-        return []
+        return [f"[除錯] 例外錯誤: {str(e)[:100]}"]
 
 # ── 寫入 Notion ────────────────────────────────────────────
 def save_to_notion(data: dict) -> bool:
