@@ -137,7 +137,7 @@ def analyze_image_with_gemini(image_bytes: bytes) -> list:
         image_b64 = base64.b64encode(image_bytes).decode("utf-8")
         url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+            f"gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
         )
         payload = {
             "contents": [{
