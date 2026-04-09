@@ -63,19 +63,52 @@ PLACEHOLDER      = "（待新增）"
 # ── 縣市與市區對應表（新增市區時會動態更新） ──────────────────
 # 格式：{ "市區名稱": "所屬縣市" }
 DISTRICT_COUNTY_MAP = {
-    "中西區": "台南",
-    "東區":   "台南",
-    "永康區": "台南",
-    "南區":   "台南",
-    "北區":   "台南",
-    "三民區": "高雄",
+    # 台南（依筆畫排序：北=5, 永=5, 東=8, 南=9, 中=4, 三=3）
+    "三民區": "高雄",  # ← 高雄，筆畫3，排最前
+    "中西區": "台南",  # 筆畫4
+    "北區":   "台南",  # 筆畫5
+    "永康區": "台南",  # 筆畫5
+    "東區":   "台南",  # 筆畫8
+    "南區":   "台南",  # 筆畫9
 }
 
+# 台南市區（依筆畫排序後的清單，供 fetch 時使用）
+TAINAN_DISTRICTS_SORTED = ["中西區", "北區", "永康區", "東區", "南區"]
+KAOHSIUNG_DISTRICTS_SORTED = ["三民區"]
+
 def get_districts_for_county(county: str) -> list:
-    """根據已選縣市，過濾出對應的市區清單"""
-    return [d for d, c in DISTRICT_COUNTY_MAP.items() if c == county]
+    """根據已選縣市，過濾出對應的市區清單（依筆畫排序）"""
+    if county == "台南":
+        base = TAINAN_DISTRICTS_SORTED[:]
+    elif county == "高雄":
+        base = KAOHSIUNG_DISTRICTS_SORTED[:]
+    else:
+        base = [d for d, c in DISTRICT_COUNTY_MAP.items() if c == county]
+    # 加入本次 session 新增的市區
+    extra = [d for d, c in DISTRICT_COUNTY_MAP.items() if c == county and d not in base]
+    return base + extra
 
 # ── 動態讀取 Notion 選項 ───────────────────────────────────
+# 種類筆畫排序清單
+TYPES_STROKE_ORDER = [
+    "丼飯", "中式料理", "手搖", "水餃", "火鍋",
+    "牛舌", "牛排", "牛肉麵", "四川麻辣", "早午餐",
+    "印度咖喱", "拉麵", "拼盤", "和牛", "泡芙",
+    "炸雞", "烤餅", "泰式", "泰式料理", "甜點",
+    "麻辣鍋", "焗烤", "義式料理", "壽喜燒", "歐姆蛋包飯",
+    "燒肉", "鴨肉飯", "鐵鍋燉",
+]
+
+def sort_options(opts: list) -> list:
+    """將選項依筆畫排序（種類用預定清單，其他用 Unicode 碼位近似）"""
+    def key(s):
+        # 若在種類排序表中，依表中順序
+        if s in TYPES_STROKE_ORDER:
+            return (0, TYPES_STROKE_ORDER.index(s))
+        # 其他中文：用第一個字的 Unicode 碼位近似筆畫
+        return (1, ord(s[0]))
+    return sorted(opts, key=key)
+
 def fetch_notion_options():
     url = f"https://api.notion.com/v1/databases/{NOTION_DB_ID}"
     try:
@@ -84,10 +117,11 @@ def fetch_notion_options():
             logger.warning(f"讀取 Notion 欄位失敗: {resp.text}")
             return [], [], []
         props = resp.json().get("properties", {})
-        county_opts   = [o["name"] for o in props.get("縣市", {}).get("select",       {}).get("options", [])]
-        district_opts = [o["name"] for o in props.get("市區", {}).get("select",       {}).get("options", [])]
-        type_opts     = [o["name"] for o in props.get("種類", {}).get("multi_select", {}).get("options", [])]
-        return county_opts, district_opts, type_opts
+        county_opts = [o["name"] for o in props.get("縣市", {}).get("select",       {}).get("options", [])]
+        type_opts   = [o["name"] for o in props.get("種類", {}).get("multi_select", {}).get("options", [])]
+        # 種類依筆畫排序（已知的排序表 + 新增的排在後面）
+        type_opts = sort_options(type_opts)
+        return county_opts, [], type_opts
     except Exception as e:
         logger.error(f"fetch_notion_options 錯誤: {e}")
         return [], [], []
