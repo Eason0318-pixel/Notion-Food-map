@@ -1,11 +1,13 @@
 import os
 import logging
+import re
+import unicodedata
 import requests
 import base64
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
-    filters, ContextTypes, ConversationHandler
+    filters, ContextTypes
 )
 
 # ── 環境變數 ──────────────────────────────────────────────
@@ -14,20 +16,6 @@ NOTION_TOKEN    = os.environ["NOTION_TOKEN"]
 NOTION_DB_ID    = os.environ["NOTION_DATABASE_ID"]
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
 GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY", "")
-
-# ── 日誌 ─────────────────────────────────────────────────
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-
-# ── Notion API Header ─────────────────────────────────────
-NOTION_HEADERS = {
-    "Authorization": f"Bearer {NOTION_TOKEN}",
-    "Notion-Version": "2022-06-28",
-    "Content-Type": "application/json",
-}
 
 # ── 特殊按鈕常數 ──────────────────────────────────────────
 BTN_DONE         = "✅ 完成選擇"
@@ -42,230 +30,187 @@ BTN_ADD_DISTRICT = "➕ 新增市區"
 BTN_ADD_TYPE     = "➕ 新增種類"
 PLACEHOLDER      = "（待新增）"
 
-# ── 對話狀態 ──────────────────────────────────────────────
-(
-    ASK_NAME,
-    ASK_NAME_PHOTO,       # 等待截圖上傳
-    ASK_NAME_CONFIRM,     # Gemini 建議名稱後確認
-    ASK_COUNTY,
-    ASK_COUNTY_NEW,
-    ASK_DISTRICT,
-    ASK_DISTRICT_NEW,
-    ASK_TYPE,
-    ASK_TYPE_NEW,
-    ASK_HOURS,
-    ASK_FEATURE,
-    ASK_RATING,
-    ASK_URL,
-    CONFIRM,
-) = range(14)
+# ── 狀態常數 ─────────────────────────────────────────────
+ST_WAIT_LINK       = 1
+ST_INPUT_NAME      = 2
+ST_WAIT_PHOTO      = 3
+ST_SELECT_COUNTY   = 4
+ST_INPUT_NEW_COUNTY = 5
+ST_SELECT_DISTRICT = 6
+ST_INPUT_NEW_DISTRICT = 7
+ST_SELECT_TYPE     = 8
+ST_INPUT_NEW_TYPE  = 9
+ST_CONFIRM_SIMILAR = 10   # ← 新增：相似選項確認狀態
+ST_INPUT_HOURS     = 11
+ST_INPUT_FEATURE   = 12
+ST_INPUT_REVIEW    = 13
+ST_FINAL_CONFIRM   = 14
 
-# ── 縣市與市區對應表（新增市區時會動態更新） ──────────────────
-# 格式：{ "市區名稱": "所屬縣市" }
-DISTRICT_COUNTY_MAP = {
-    # 台南（依筆畫排序：北=5, 永=5, 東=8, 南=9, 中=4, 三=3）
-    "三民區": "高雄",  # ← 高雄，筆畫3，排最前
-    "中西區": "台南",  # 筆畫4
-    "北區":   "台南",  # 筆畫5
-    "永康區": "台南",  # 筆畫5
-    "東區":   "台南",  # 筆畫8
-    "南區":   "台南",  # 筆畫9
-}
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# 台南市區（依筆畫排序後的清單，供 fetch 時使用）
-TAINAN_DISTRICTS_SORTED = ["中西區", "北區", "永康區", "東區", "南區"]
-KAOHSIUNG_DISTRICTS_SORTED = ["三民區"]
-
-def get_districts_for_county(county: str) -> list:
-    """根據已選縣市，過濾出對應的市區清單（依筆畫排序）"""
-    if county == "台南":
-        base = TAINAN_DISTRICTS_SORTED[:]
-    elif county == "高雄":
-        base = KAOHSIUNG_DISTRICTS_SORTED[:]
-    else:
-        base = [d for d, c in DISTRICT_COUNTY_MAP.items() if c == county]
-    # 加入本次 session 新增的市區
-    extra = [d for d, c in DISTRICT_COUNTY_MAP.items() if c == county and d not in base]
-    return base + extra
-
-# ── 動態讀取 Notion 選項 ───────────────────────────────────
-# 種類筆畫排序清單
-TYPES_STROKE_ORDER = [
-    "丼飯", "中式料理", "手搖", "水餃", "火鍋",
-    "牛舌", "牛排", "牛肉麵", "四川麻辣", "早午餐",
-    "印度咖喱", "拉麵", "拼盤", "和牛", "泡芙",
-    "炸雞", "烤餅", "泰式", "泰式料理", "甜點",
-    "麻辣鍋", "焗烤", "義式料理", "壽喜燒", "歐姆蛋包飯",
-    "燒肉", "鴨肉飯", "鐵鍋燉",
+# ── 全域選項快取 ──────────────────────────────────────────
+GLOBAL_COUNTY   = ["台南", "高雄"]
+GLOBAL_DISTRICT = ["中西區", "東區", "永康區", "南區", "三民區", "北區"]
+GLOBAL_TYPE     = [
+    "甜點", "義式料理", "泡芙", "燒肉", "牛舌", "焗烤", "火鍋", "拉麵",
+    "鴨肉飯", "印度咖喱", "烤餅", "丼飯", "早午餐", "拼盤", "鐵鍋燉",
+    "歐姆蛋包飯", "泰式", "牛排", "四川麻辣", "和牛", "泰式料理",
+    "麻辣鍋", "手搖", "壽喜燒"
 ]
 
-def sort_options(opts: list) -> list:
-    """將選項依筆畫排序（種類用預定清單，其他用 Unicode 碼位近似）"""
-    def key(s):
-        # 若在種類排序表中，依表中順序
-        if s in TYPES_STROKE_ORDER:
-            return (0, TYPES_STROKE_ORDER.index(s))
-        # 其他中文：用第一個字的 Unicode 碼位近似筆畫
-        return (1, ord(s[0]))
-    return sorted(opts, key=key)
+def normalize(text: str) -> str:
+    """標準化文字：去除空白、轉全形為半形、轉小寫"""
+    text = text.strip()
+    text = unicodedata.normalize("NFKC", text)
+    return text.lower()
 
-def fetch_notion_options():
-    url = f"https://api.notion.com/v1/databases/{NOTION_DB_ID}"
+def find_similar(new_text: str, options: list) -> list:
+    """
+    方案B：找出相似選項
+    - 完全相符（normalize後）→ 回傳該選項（完全相符flag）
+    - 相似（其中一個包含另一個，或共用2個以上字符）→ 回傳相似清單
+    """
+    norm_new = normalize(new_text)
+    exact = []
+    similar = []
+
+    for opt in options:
+        norm_opt = normalize(opt)
+        if norm_new == norm_opt:
+            exact.append(opt)
+        elif norm_new in norm_opt or norm_opt in norm_new:
+            similar.append(opt)
+        else:
+            # 計算共用字符數（中文字）
+            common_chars = sum(1 for c in norm_new if c in norm_opt)
+            if common_chars >= 2:
+                similar.append(opt)
+
+    return exact, similar
+
+# ── 從 Notion 載入選項 ────────────────────────────────────
+def load_options_from_notion():
+    global GLOBAL_COUNTY, GLOBAL_DISTRICT, GLOBAL_TYPE
     try:
-        resp = requests.get(url, headers=NOTION_HEADERS, timeout=10)
-        if resp.status_code != 200:
-            logger.warning(f"讀取 Notion 欄位失敗: {resp.text}")
-            return [], [], []
-        props = resp.json().get("properties", {})
-        county_opts = [o["name"] for o in props.get("縣市", {}).get("select",       {}).get("options", [])]
-        type_opts   = [o["name"] for o in props.get("種類", {}).get("multi_select", {}).get("options", [])]
-        # 種類依筆畫排序（已知的排序表 + 新增的排在後面）
-        type_opts = sort_options(type_opts)
-        return county_opts, [], type_opts
+        r = requests.get(
+            f"https://api.notion.com/v1/databases/{NOTION_DB_ID}",
+            headers={
+                "Authorization": f"Bearer {NOTION_TOKEN}",
+                "Notion-Version": "2022-06-28"
+            },
+            timeout=15
+        )
+        r.raise_for_status()
+        props = r.json().get("properties", {})
+
+        county   = [o["name"] for o in props.get("縣市", {}).get("select", {}).get("options", [])]
+        district = [o["name"] for o in props.get("市區", {}).get("select", {}).get("options", [])]
+        types    = [o["name"] for o in props.get("種類", {}).get("multi_select", {}).get("options", [])]
+
+        if county:   GLOBAL_COUNTY   = county
+        if district: GLOBAL_DISTRICT = district
+        if types:    GLOBAL_TYPE     = types
+        logger.info("Notion 選項載入完成")
     except Exception as e:
-        logger.error(f"fetch_notion_options 錯誤: {e}")
-        return [], [], []
+        logger.error(f"載入 Notion 選項失敗: {e}")
 
-# ── YouTube 標題抓取 ───────────────────────────────────────
-def get_youtube_title(url: str) -> str:
-    if not YOUTUBE_API_KEY:
+# ── YouTube 標題抓取 ──────────────────────────────────────
+def extract_yt_id(url: str):
+    m = re.search(r"youtu\.be/([A-Za-z0-9_-]+)", url)
+    if m: return m.group(1)
+    m = re.search(r"youtube\.com/watch.*v=([A-Za-z0-9_-]+)", url)
+    if m: return m.group(1)
+    return None
+
+def fetch_youtube_title(url: str) -> str:
+    vid = extract_yt_id(url)
+    if not vid or not YOUTUBE_API_KEY:
         return ""
-    import re
-    match = re.search(r"(?:v=|youtu\.be/|shorts/)([A-Za-z0-9_-]{11})", url)
-    if not match:
-        return ""
-    video_id = match.group(1)
-    api_url = (
-        f"https://www.googleapis.com/youtube/v3/videos"
-        f"?part=snippet&id={video_id}&key={YOUTUBE_API_KEY}"
-    )
     try:
-        r = requests.get(api_url, timeout=5)
+        r = requests.get(
+            f"https://www.googleapis.com/youtube/v3/videos?part=snippet&id={vid}&key={YOUTUBE_API_KEY}",
+            timeout=15
+        )
+        r.raise_for_status()
         items = r.json().get("items", [])
-        if items:
-            return items[0]["snippet"]["title"]
+        if not items: return ""
+        return items[0]["snippet"].get("title", "")
     except Exception as e:
-        logger.warning(f"YouTube API 錯誤: {e}")
+        logger.error(f"YouTube 失敗: {e}")
+        return ""
+
+# ── Gemini Vision 截圖辨識 ────────────────────────────────
+def gemini_recognize_name(photo_bytes: bytes) -> str:
+    if not GEMINI_API_KEY:
+        return ""
+    try:
+        b64 = base64.b64encode(photo_bytes).decode()
+        prompt = (
+            "這是一張餐廳或美食相關的貼文截圖，請幫我辨識餐廳名稱。"
+            "請依序檢查：1.引號、書名號、括號標示的文字 2.hashtag中的店名 "
+            "3.貼文開頭或結尾的店名標示 4.圖片上的店招牌或Logo 5.內文中像店名的專有名詞。"
+            "請只回傳餐廳名稱，不要其他說明。"
+        )
+        r = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}",
+            json={
+                "contents": [{
+                    "parts": [
+                        {"inline_data": {"mime_type": "image/jpeg", "data": b64}},
+                        {"text": prompt}
+                    ]
+                }]
+            },
+            timeout=30
+        )
+        r.raise_for_status()
+        candidates = r.json().get("candidates", [])
+        if candidates:
+            return candidates[0]["content"]["parts"][0].get("text", "").strip()
+    except Exception as e:
+        logger.error(f"Gemini 失敗: {e}")
     return ""
 
-# ── Gemini Vision 圖片辨識 ────────────────────────────────
-def detect_mime_type(image_bytes: bytes) -> str:
-    """自動偵測圖片格式，避免格式標註錯誤導致辨識失敗"""
-    if image_bytes[:8] == b'\x89PNG\r\n\x1a\n':
-        return "image/png"
-    elif image_bytes[:3] == b'\xff\xd8\xff':
-        return "image/jpeg"
-    elif image_bytes[:4] == b'RIFF' and image_bytes[8:12] == b'WEBP':
-        return "image/webp"
-    return "image/jpeg"  # 預設
-
-def analyze_image_with_gemini(image_bytes: bytes) -> list:
-    """
-    將圖片傳給 Gemini Vision，請它從截圖中辨識餐廳名稱。
-    回傳建議的餐廳名稱清單，失敗則回傳空清單。
-    """
-    if not GEMINI_API_KEY:
-        return []
+# ── 寫入 Notion ───────────────────────────────────────────
+def write_notion(name, url, county, district, types, hours, feature, review) -> bool:
     try:
-        mime_type = detect_mime_type(image_bytes)
-        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
-        url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
-        )
-        payload = {
-            "contents": [{
-                "parts": [
-                    {
-                        "inline_data": {
-                            "mime_type": mime_type,
-                            "data": image_b64
-                        }
-                    },
-                    {
-                        "text": (
-                            "這是一張來自 Instagram 或 Threads 的餐廳美食貼文截圖。"
-                            "請仔細分析圖片中所有文字，找出餐廳店名。\n"
-                            "店名最常出現在以下位置，請依序優先檢查：\n"
-                            "1. 內文開頭用《》、<<>>、【】、「」、''包住的文字（例如：<<小泰菜 Small Thai>>）\n"
-                            "2. 貼文下方的地標／打卡位置圖示旁的文字（📍後面的店名）\n"
-                            "3. hashtag 中出現的店名（去掉#號，例如：#小泰菜 → 小泰菜）\n"
-                            "4. 內文中明顯是中文店名或中英文混合店名的專有名詞\n"
-                            "5. 圖片上的招牌或 Logo 文字\n"
-                            "6. IG 帳號名稱（通常與店名相關，可作為參考）\n"
-                            "如果同一個店名在中文和英文都有出現，優先回傳中文名稱。"
-                            "請回傳最多 3 個最可能是餐廳名稱的候選，"
-                            "每個名稱單獨一行，不要加編號、符號或任何說明文字。"
-                            "如果只找到一個，就只回傳一個。"
-                            "如果完全無法判斷，只回傳「無法辨識」。"
-                        )
-                    }
-                ]
-            }]
+        props = {
+            "Name": {"title": [{"type": "text", "text": {"content": name}}]},
+            "縣市": {"select": {"name": county}} if county else {},
+            "市區": {"select": {"name": district}} if district else {},
+            "種類": {"multi_select": [{"name": t} for t in types]},
         }
-        resp = requests.post(url, json=payload, timeout=15)
-        if resp.status_code == 200:
-            result = resp.json()
-            raw = result["candidates"][0]["content"]["parts"][0]["text"].strip()
-            logger.info(f"Gemini 回傳原始內容: {raw}")
-            if raw == "無法辨識":
-                return []
-            candidates = [line.strip() for line in raw.splitlines() if line.strip()][:3]
-            return candidates
-        else:
-            # 回傳錯誤碼和詳細訊息，方便除錯
-            logger.error(f"Gemini API 錯誤 {resp.status_code}: {resp.text}")
-            return [f"[除錯] API錯誤 {resp.status_code}: {resp.text[:100]}"]
-    except Exception as e:
-        logger.error(f"analyze_image_with_gemini 錯誤: {e}")
-        return [f"[除錯] 例外錯誤: {str(e)[:100]}"]
+        if hours:   props["營業時間"] = {"rich_text": [{"text": {"content": hours}}]}
+        if feature: props["特色"]    = {"rich_text": [{"text": {"content": feature}}]}
+        if review:  props["評價"]    = {"rich_text": [{"text": {"content": review}}]}
+        # URL 存入頁面 icon 備用欄位（如有 URL 欄位可改這裡）
+        # 這裡把連結加到 Name 的 link
+        if url:
+            props["Name"] = {"title": [{"type": "text", "text": {"content": name, "link": {"url": url}}}]}
 
-# ── 寫入 Notion ────────────────────────────────────────────
-def save_to_notion(data: dict) -> bool:
-    url = "https://api.notion.com/v1/pages"
-    properties = {
-        "Name": {
-            "title": [{"text": {"content": data.get("名稱", "未命名")}}]
-        },
-        "種類": {
-            "multi_select": [{"name": t} for t in data.get("種類", [])]
-        },
-        "營業時間": {
-            "rich_text": [{"text": {"content": data.get("營業時間", "")}}]
-        },
-        "特色": {
-            "rich_text": [{"text": {"content": data.get("特色", "")}}]
-        },
-        "評價": {
-            "rich_text": [{"text": {"content": data.get("評價", "")}}]
-        },
-    }
-    if data.get("縣市"):
-        properties["縣市"] = {"select": {"name": data["縣市"]}}
-    if data.get("市區"):
-        properties["市區"] = {"select": {"name": data["市區"]}}
-    link = data.get("連結", "")
-    if link:
-        properties["Name"]["title"][0]["text"]["link"] = {"url": link}
-    body = {"parent": {"database_id": NOTION_DB_ID}, "properties": properties}
-    try:
-        resp = requests.post(url, headers=NOTION_HEADERS, json=body, timeout=10)
-        if resp.status_code == 200:
-            logger.info("成功寫入 Notion")
-            return True
-        else:
-            logger.error(f"Notion 寫入失敗: {resp.text}")
-            return False
+        r = requests.post(
+            "https://api.notion.com/v1/pages",
+            headers={
+                "Authorization": f"Bearer {NOTION_TOKEN}",
+                "Content-Type": "application/json",
+                "Notion-Version": "2022-06-28"
+            },
+            json={
+                "parent": {"database_id": NOTION_DB_ID},
+                "properties": props
+            },
+            timeout=15
+        )
+        r.raise_for_status()
+        load_options_from_notion()
+        return True
     except Exception as e:
-        logger.error(f"save_to_notion 錯誤: {e}")
+        logger.error(f"Notion 失敗: {e}")
         return False
 
-# ══════════════════════════════════════════════════════════
-# 鍵盤產生器
-# ══════════════════════════════════════════════════════════
-
-def _opts_rows(opts: list) -> list:
-    """每排兩個，單數補 PLACEHOLDER 佔位"""
+# ── 鍵盤工具函式 ──────────────────────────────────────────
+def _pair_rows(opts):
     padded = opts[:]
     if len(padded) % 2 != 0:
         padded.append(PLACEHOLDER)
@@ -274,578 +219,459 @@ def _opts_rows(opts: list) -> list:
         rows.append(padded[i:i+2])
     return rows
 
-def name_keyboard() -> ReplyKeyboardMarkup:
-    """
-    [ 📸 上傳截圖由 AI 辨識 ]
-    [ ⏭️ 略過 ]  [ ❌ 取消本次動作 ]
-    """
-    rows = [
-        [BTN_UPLOAD_IMG],
-        [BTN_SKIP, BTN_CANCEL],
-    ]
-    return ReplyKeyboardMarkup(rows, one_time_keyboard=True, resize_keyboard=True)
-
-def name_confirm_keyboard() -> ReplyKeyboardMarkup:
-    """Gemini 建議名稱後的確認鍵盤"""
-    rows = [
-        [BTN_CONFIRM],
-        [BTN_SKIP, BTN_CANCEL],
-    ]
-    return ReplyKeyboardMarkup(rows, one_time_keyboard=True, resize_keyboard=True)
-
-def county_keyboard(county_opts: list) -> ReplyKeyboardMarkup:
+def make_single_kb(opts, add_btn):
     rows = [[BTN_BACK]]
-    rows += _opts_rows(county_opts)
-    rows.append([BTN_ADD_COUNTY])
+    rows += _pair_rows(opts)
+    rows.append([add_btn])
     rows.append([BTN_CANCEL])
     return ReplyKeyboardMarkup(rows, one_time_keyboard=True, resize_keyboard=True)
 
-def district_keyboard(district_opts: list) -> ReplyKeyboardMarkup:
-    rows = [[BTN_BACK]]
-    rows += _opts_rows(district_opts)
-    rows.append([BTN_ADD_DISTRICT])
-    rows.append([BTN_CANCEL])
-    return ReplyKeyboardMarkup(rows, one_time_keyboard=True, resize_keyboard=True)
-
-def type_keyboard(type_opts: list, has_selection: bool) -> ReplyKeyboardMarkup:
+def make_multi_kb(opts, selected, add_btn):
     rows = []
-    if has_selection:
+    if selected:
         rows.append([BTN_DONE])
     rows.append([BTN_UNDO, BTN_BACK])
-    rows += _opts_rows(type_opts)
-    rows.append([BTN_ADD_TYPE])
+    rows += _pair_rows(opts)
+    rows.append([add_btn])
     rows.append([BTN_CANCEL])
     return ReplyKeyboardMarkup(rows, one_time_keyboard=True, resize_keyboard=True)
 
-def text_input_keyboard() -> ReplyKeyboardMarkup:
-    rows = [
-        [BTN_SKIP],
-        [BTN_BACK, BTN_CANCEL],
-    ]
-    return ReplyKeyboardMarkup(rows, one_time_keyboard=True, resize_keyboard=True)
-
-def confirm_keyboard() -> ReplyKeyboardMarkup:
-    rows = [
-        [BTN_CONFIRM],
-        [BTN_BACK, BTN_CANCEL],
-    ]
-    return ReplyKeyboardMarkup(rows, one_time_keyboard=True, resize_keyboard=True)
-
-# ── 工具函數 ──────────────────────────────────────────────
-def is_url(text: str) -> bool:
-    return text.startswith("http://") or text.startswith("https://")
-
-async def do_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    await update.message.reply_text(
-        "已取消本次動作。直接傳連結或輸入名稱可重新開始。",
-        reply_markup=ReplyKeyboardRemove()
+def make_confirm_kb():
+    return ReplyKeyboardMarkup(
+        [[BTN_CONFIRM], [BTN_BACK, BTN_CANCEL]],
+        one_time_keyboard=True, resize_keyboard=True
     )
-    return ConversationHandler.END
 
-async def _load_notion_and_go_county(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """讀取 Notion 選項後跳往縣市選擇"""
-    county_opts, _, type_opts = fetch_notion_options()
-    context.user_data["_county_opts"] = county_opts
-    context.user_data["_type_opts"]   = type_opts
-    # 市區清單不從 Notion 讀，改由對應表動態產生（選完縣市後才決定）
-    name = context.user_data.get("名稱", "未命名")
-    await update.message.reply_text(
-        f"已記錄：{name}\n\n請選擇縣市：",
-        reply_markup=county_keyboard(county_opts)
+def make_skip_kb():
+    return ReplyKeyboardMarkup(
+        [[BTN_SKIP], [BTN_BACK, BTN_CANCEL]],
+        one_time_keyboard=True, resize_keyboard=True
     )
-    return ASK_COUNTY
 
-# ══════════════════════════════════════════════════════════
-# 對話流程
-# ══════════════════════════════════════════════════════════
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    await update.message.reply_text(
-        "敏的美食地圖 Bot！\n\n直接傳入餐廳連結，或輸入餐廳名稱開始：",
-        reply_markup=ReplyKeyboardRemove()
+def make_name_kb():
+    return ReplyKeyboardMarkup(
+        [[BTN_UPLOAD_IMG], [BTN_SKIP, BTN_CANCEL]],
+        one_time_keyboard=True, resize_keyboard=True
     )
-    return ASK_NAME
 
+# ── 顯示各步驟 ────────────────────────────────────────────
+def get_st(ctx):    return ctx.user_data.get("st", ST_WAIT_LINK)
+def set_st(ctx, s): ctx.user_data["st"] = s
 
-async def receive_url_direct(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """偵測到網址，自動啟動流程"""
-    context.user_data.clear()
-    text = update.message.text.strip()
-    context.user_data["連結"] = text
+async def show_name(update, ctx):
+    set_st(ctx, ST_INPUT_NAME)
+    await update.message.reply_text(
+        "🍽️ 請輸入餐廳名稱：\n（或上傳貼文截圖讓 AI 辨識，也可略過）",
+        reply_markup=make_name_kb()
+    )
 
-    if "youtube.com" in text or "youtu.be" in text:
-        title = get_youtube_title(text)
-        if title:
-            context.user_data["名稱"] = title
-            await update.message.reply_text(
-                f"偵測到 YouTube！已自動抓取標題：{title}\n\n"
-                "若想修改名稱請輸入新名稱，否則點「略過」繼續：",
-                reply_markup=name_keyboard()
-            )
-        else:
-            await update.message.reply_text(
-                "偵測到 YouTube 連結，請輸入餐廳名稱：",
-                reply_markup=name_keyboard()
-            )
-    else:
-        await update.message.reply_text(
-            "已收到連結！\n請輸入餐廳名稱，或選擇下方選項：",
-            reply_markup=name_keyboard()
-        )
-    return ASK_NAME
+async def show_county(update, ctx):
+    set_st(ctx, ST_SELECT_COUNTY)
+    opts = list(GLOBAL_COUNTY)
+    await update.message.reply_text(
+        "🗺️ 請選擇縣市：",
+        reply_markup=make_single_kb(opts, BTN_ADD_COUNTY)
+    )
 
+async def show_district(update, ctx):
+    set_st(ctx, ST_SELECT_DISTRICT)
+    opts = list(GLOBAL_DISTRICT)
+    await update.message.reply_text(
+        "📍 請選擇市區：",
+        reply_markup=make_single_kb(opts, BTN_ADD_DISTRICT)
+    )
 
-async def ask_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
+async def show_type(update, ctx):
+    set_st(ctx, ST_SELECT_TYPE)
+    sel = ctx.user_data.get("sel_types", [])
+    all_types = list(GLOBAL_TYPE)
+    for t in ctx.user_data.get("extra_types", []):
+        if t not in all_types:
+            all_types.append(t)
+    rem = [t for t in all_types if t not in sel]
+    sel_text = "、".join(sel) if sel else "（尚未選擇）"
+    await update.message.reply_text(
+        f"🍜 請選擇料理種類（可多選）\n已選：{sel_text}",
+        reply_markup=make_multi_kb(rem, sel, BTN_ADD_TYPE)
+    )
+
+async def show_hours(update, ctx):
+    set_st(ctx, ST_INPUT_HOURS)
+    await update.message.reply_text(
+        "🕐 請輸入營業時間：\n（例：11:00–21:00，週一公休）",
+        reply_markup=make_skip_kb()
+    )
+
+async def show_feature(update, ctx):
+    set_st(ctx, ST_INPUT_FEATURE)
+    await update.message.reply_text(
+        "✨ 請輸入餐廳特色：",
+        reply_markup=make_skip_kb()
+    )
+
+async def show_review(update, ctx):
+    set_st(ctx, ST_INPUT_REVIEW)
+    await update.message.reply_text(
+        "⭐ 請輸入你的評價：",
+        reply_markup=make_skip_kb()
+    )
+
+async def show_confirm(update, ctx):
+    set_st(ctx, ST_FINAL_CONFIRM)
+    d = ctx.user_data
+    url_line = f"\n🔗 連結：{d.get('url','')}" if d.get('url') else ""
+    types_text = "、".join(d.get("sel_types", [])) or "（未選）"
+    await update.message.reply_text(
+        f"📋 請確認以下資料：\n\n"
+        f"🍽️ 名稱：{d.get('name','（未填）')}{url_line}\n"
+        f"🗺️ 縣市：{d.get('county','（未選）')}\n"
+        f"📍 市區：{d.get('district','（未選）')}\n"
+        f"🍜 種類：{types_text}\n"
+        f"🕐 營業時間：{d.get('hours','（略過）')}\n"
+        f"✨ 特色：{d.get('feature','（略過）')}\n"
+        f"⭐ 評價：{d.get('review','（略過）')}\n\n"
+        f"確認存入 Notion 嗎？",
+        reply_markup=make_confirm_kb()
+    )
+
+async def do_cancel(update, ctx):
+    ctx.user_data.clear()
+    set_st(ctx, ST_WAIT_LINK)
+    await update.message.reply_text("已取消本次動作。", reply_markup=ReplyKeyboardRemove())
+
+# ── 主訊息處理 ────────────────────────────────────────────
+async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    st   = get_st(ctx)
 
     if text == BTN_CANCEL:
-        return await do_cancel(update, context)
+        await do_cancel(update, ctx)
+        return
 
-    if text == BTN_UPLOAD_IMG:
-        await update.message.reply_text(
-            "請上傳餐廳貼文的截圖，AI 將自動辨識餐廳名稱：",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        return ASK_NAME_PHOTO
+    # ── 等待連結 ──
+    if st == ST_WAIT_LINK:
+        if re.search(r"https?://", text, re.I):
+            ctx.user_data["url"] = text
+            ctx.user_data["sel_types"] = []
+            ctx.user_data["extra_types"] = []
+            if re.search(r"youtube\.com/watch|youtu\.be/", text, re.I):
+                await update.message.reply_text("▶️ YouTube 正在抓取標題...")
+                title = fetch_youtube_title(text)
+                ctx.user_data["name"] = title
+                msg = f"找到影片：{title}" if title else "連結已記住（未能抓到標題）"
+                await update.message.reply_text(msg)
+            else:
+                await update.message.reply_text("✅ 連結已記住！")
+            await show_name(update, ctx)
+        else:
+            await update.message.reply_text("請傳給我一個連結（IG / Threads / YouTube 等）")
 
-    if is_url(text):
-        context.user_data["連結"] = text
-        if "youtube.com" in text or "youtu.be" in text:
-            title = get_youtube_title(text)
-            if title:
-                context.user_data["名稱"] = title
-        await update.message.reply_text(
-            "已記錄連結！\n請輸入餐廳名稱，或選擇下方選項：",
-            reply_markup=name_keyboard()
-        )
-        return ASK_NAME
-
-    if text in (BTN_SKIP, "略過"):
-        if not context.user_data.get("名稱"):
-            context.user_data["名稱"] = "未命名"
-    else:
-        context.user_data["名稱"] = text
-
-    return await _load_notion_and_go_county(update, context)
-
-
-async def ask_name_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """等待截圖上傳，收到圖片後丟給 Gemini 分析"""
-
-    # 如果使用者傳的是文字而不是圖片
-    if not update.message.photo:
-        await update.message.reply_text(
-            "請直接傳送圖片截圖（不是連結），或點「取消」返回：",
-            reply_markup=ReplyKeyboardMarkup(
-                [[BTN_CANCEL]], one_time_keyboard=True, resize_keyboard=True
+    # ── 輸入名稱 ──
+    elif st == ST_INPUT_NAME:
+        if text == BTN_UPLOAD_IMG:
+            set_st(ctx, ST_WAIT_PHOTO)
+            await update.message.reply_text(
+                "📸 請上傳截圖，AI 將幫你辨識餐廳名稱：",
+                reply_markup=ReplyKeyboardRemove()
             )
-        )
-        return ASK_NAME_PHOTO
+        elif text == BTN_SKIP:
+            ctx.user_data["name"] = ctx.user_data.get("name", "")
+            await show_county(update, ctx)
+        else:
+            ctx.user_data["name"] = text
+            await show_county(update, ctx)
 
-    await update.message.reply_text("正在分析截圖，請稍候...")
+    # ── 等待截圖 ──
+    elif st == ST_WAIT_PHOTO:
+        await update.message.reply_text("請上傳「圖片」，不是文字訊息喔～")
 
-    # 取最高畫質的圖片
+    # ── 選縣市 ──
+    elif st == ST_SELECT_COUNTY:
+        if text == BTN_BACK:
+            await show_name(update, ctx)
+        elif text == BTN_ADD_COUNTY:
+            set_st(ctx, ST_INPUT_NEW_COUNTY)
+            await update.message.reply_text("✏️ 請輸入新縣市名稱：", reply_markup=make_skip_kb())
+        elif text == PLACEHOLDER:
+            await update.message.reply_text("請從現有選項選擇，或點「➕ 新增縣市」")
+            await show_county(update, ctx)
+        elif text in GLOBAL_COUNTY:
+            ctx.user_data["county"] = text
+            await show_district(update, ctx)
+        else:
+            await show_county(update, ctx)
+
+    # ── 新增縣市 ──
+    elif st == ST_INPUT_NEW_COUNTY:
+        if text == BTN_BACK:
+            await show_county(update, ctx)
+        else:
+            if text not in GLOBAL_COUNTY:
+                GLOBAL_COUNTY.append(text)
+            ctx.user_data["county"] = text
+            await update.message.reply_text(f"✅ 已新增縣市「{text}」")
+            await show_district(update, ctx)
+
+    # ── 選市區 ──
+    elif st == ST_SELECT_DISTRICT:
+        if text == BTN_BACK:
+            await show_county(update, ctx)
+        elif text == BTN_ADD_DISTRICT:
+            set_st(ctx, ST_INPUT_NEW_DISTRICT)
+            await update.message.reply_text("✏️ 請輸入新市區名稱：", reply_markup=make_skip_kb())
+        elif text == PLACEHOLDER:
+            await update.message.reply_text("請從現有選項選擇，或點「➕ 新增市區」")
+            await show_district(update, ctx)
+        elif text in GLOBAL_DISTRICT:
+            ctx.user_data["district"] = text
+            await show_type(update, ctx)
+        else:
+            await show_district(update, ctx)
+
+    # ── 新增市區 ──
+    elif st == ST_INPUT_NEW_DISTRICT:
+        if text == BTN_BACK:
+            await show_district(update, ctx)
+        else:
+            if text not in GLOBAL_DISTRICT:
+                GLOBAL_DISTRICT.append(text)
+            ctx.user_data["district"] = text
+            await update.message.reply_text(f"✅ 已新增市區「{text}」")
+            await show_type(update, ctx)
+
+    # ── 選種類（多選）──
+    elif st == ST_SELECT_TYPE:
+        if text == BTN_DONE:
+            if not ctx.user_data.get("sel_types"):
+                await update.message.reply_text("⚠️ 請至少選一個種類！")
+                await show_type(update, ctx)
+            else:
+                await show_hours(update, ctx)
+        elif text == BTN_UNDO:
+            sel = ctx.user_data.get("sel_types", [])
+            if sel:
+                removed = sel.pop()
+                ctx.user_data["sel_types"] = sel
+                await update.message.reply_text(f"已移除「{removed}」")
+            else:
+                await update.message.reply_text("目前尚無已選種類。")
+            await show_type(update, ctx)
+        elif text == BTN_BACK:
+            await show_district(update, ctx)
+        elif text == BTN_ADD_TYPE:
+            set_st(ctx, ST_INPUT_NEW_TYPE)
+            await update.message.reply_text(
+                "✏️ 請輸入新種類名稱：",
+                reply_markup=ReplyKeyboardMarkup([[BTN_BACK, BTN_CANCEL]], resize_keyboard=True)
+            )
+        elif text == PLACEHOLDER:
+            await update.message.reply_text("請從現有選項選擇，或點「➕ 新增種類」")
+            await show_type(update, ctx)
+        else:
+            all_types = list(GLOBAL_TYPE) + ctx.user_data.get("extra_types", [])
+            if text in all_types and text not in ctx.user_data.get("sel_types", []):
+                ctx.user_data.setdefault("sel_types", []).append(text)
+            await show_type(update, ctx)
+
+    # ── 輸入新種類（方案B在這裡發動）──
+    elif st == ST_INPUT_NEW_TYPE:
+        if text == BTN_BACK:
+            await show_type(update, ctx)
+        else:
+            all_types = list(GLOBAL_TYPE) + ctx.user_data.get("extra_types", [])
+            exact, similar = find_similar(text, all_types)
+
+            if exact:
+                # 完全相符 → 自動選取，不新增
+                matched = exact[0]
+                if matched not in ctx.user_data.get("sel_types", []):
+                    ctx.user_data.setdefault("sel_types", []).append(matched)
+                await update.message.reply_text(
+                    f"⚠️ 「{text}」與現有選項「{matched}」完全相同，已自動選取，未新增重複選項。"
+                )
+                await show_type(update, ctx)
+
+            elif similar:
+                # 有相似選項 → 列出讓使用者確認
+                ctx.user_data["pending_new_type"] = text
+                ctx.user_data["similar_types"] = similar
+                set_st(ctx, ST_CONFIRM_SIMILAR)
+
+                # 建立相似選項鍵盤
+                number_emoji = ["1️⃣","2️⃣","3️⃣","4️⃣","5️⃣"]
+                rows = []
+                similar_lines = []
+                for i, s in enumerate(similar[:5]):
+                    label = f"{number_emoji[i]} {s}"
+                    rows.append([label])
+                    similar_lines.append(f"  {number_emoji[i]} {s}")
+                rows.append([f"➕ 確認新增「{text}」"])
+                rows.append([BTN_CANCEL])
+                kb = ReplyKeyboardMarkup(rows, one_time_keyboard=True, resize_keyboard=True)
+
+                similar_text = "\n".join(similar_lines)
+                await update.message.reply_text(
+                    f"⚠️ 找到以下相似選項，請確認：\n{similar_text}\n\n"
+                    f"請選擇其中一個，或點下方按鈕確認新增「{text}」：",
+                    reply_markup=kb
+                )
+            else:
+                # 無相似 → 直接新增
+                ctx.user_data.setdefault("extra_types", []).append(text)
+                ctx.user_data.setdefault("sel_types", []).append(text)
+                await update.message.reply_text(f"✅ 已新增種類「{text}」")
+                await show_type(update, ctx)
+
+    # ── 確認相似選項（方案B的回應）──
+    elif st == ST_CONFIRM_SIMILAR:
+        pending = ctx.user_data.get("pending_new_type", "")
+        similar = ctx.user_data.get("similar_types", [])
+        confirm_btn = f"➕ 確認新增「{pending}」"
+
+        if text == confirm_btn:
+            # 確認新增
+            ctx.user_data.setdefault("extra_types", []).append(pending)
+            ctx.user_data.setdefault("sel_types", []).append(pending)
+            ctx.user_data.pop("pending_new_type", None)
+            ctx.user_data.pop("similar_types", None)
+            await update.message.reply_text(f"✅ 已新增種類「{pending}」")
+            await show_type(update, ctx)
+        else:
+            # 嘗試比對使用者選的相似選項按鈕
+            number_emoji = ["1️⃣","2️⃣","3️⃣","4️⃣","5️⃣"]
+            chosen = None
+            for i, s in enumerate(similar[:5]):
+                if text == f"{number_emoji[i]} {s}":
+                    chosen = s
+                    break
+            if chosen:
+                if chosen not in ctx.user_data.get("sel_types", []):
+                    ctx.user_data.setdefault("sel_types", []).append(chosen)
+                ctx.user_data.pop("pending_new_type", None)
+                ctx.user_data.pop("similar_types", None)
+                await update.message.reply_text(f"✅ 已選取「{chosen}」")
+                await show_type(update, ctx)
+            else:
+                await update.message.reply_text("請點選上方按鈕選擇，或確認新增。")
+
+    # ── 輸入營業時間 ──
+    elif st == ST_INPUT_HOURS:
+        if text == BTN_BACK:
+            await show_type(update, ctx)
+        elif text == BTN_SKIP:
+            ctx.user_data["hours"] = ""
+            await show_feature(update, ctx)
+        else:
+            ctx.user_data["hours"] = text
+            await show_feature(update, ctx)
+
+    # ── 輸入特色 ──
+    elif st == ST_INPUT_FEATURE:
+        if text == BTN_BACK:
+            await show_hours(update, ctx)
+        elif text == BTN_SKIP:
+            ctx.user_data["feature"] = ""
+            await show_review(update, ctx)
+        else:
+            ctx.user_data["feature"] = text
+            await show_review(update, ctx)
+
+    # ── 輸入評價 ──
+    elif st == ST_INPUT_REVIEW:
+        if text == BTN_BACK:
+            await show_feature(update, ctx)
+        elif text == BTN_SKIP:
+            ctx.user_data["review"] = ""
+            await show_confirm(update, ctx)
+        else:
+            ctx.user_data["review"] = text
+            await show_confirm(update, ctx)
+
+    # ── 最終確認 ──
+    elif st == ST_FINAL_CONFIRM:
+        if text == BTN_CONFIRM:
+            await update.message.reply_text("⏳ 寫入 Notion 中...")
+            d = ctx.user_data
+            ok = write_notion(
+                d.get("name", ""),
+                d.get("url", ""),
+                d.get("county", ""),
+                d.get("district", ""),
+                d.get("sel_types", []),
+                d.get("hours", ""),
+                d.get("feature", ""),
+                d.get("review", "")
+            )
+            if ok:
+                await update.message.reply_text(
+                    "🎉 成功存入 Notion！下一間傳過來就好 👋",
+                    reply_markup=ReplyKeyboardRemove()
+                )
+            else:
+                await update.message.reply_text(
+                    "❌ 寫入失敗，請確認 NOTION_TOKEN 是否正確。",
+                    reply_markup=ReplyKeyboardRemove()
+                )
+            ctx.user_data.clear()
+            set_st(ctx, ST_WAIT_LINK)
+        elif text == BTN_BACK:
+            await show_review(update, ctx)
+        else:
+            await show_confirm(update, ctx)
+
+    else:
+        ctx.user_data.clear()
+        set_st(ctx, ST_WAIT_LINK)
+        await update.message.reply_text("已重置。請重新傳連結給我：", reply_markup=ReplyKeyboardRemove())
+
+# ── 處理照片（Gemini 截圖辨識）────────────────────────────
+async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    st = get_st(ctx)
+    if st != ST_WAIT_PHOTO:
+        await update.message.reply_text("請先傳連結給我，再開始流程。")
+        return
+
+    await update.message.reply_text("🔍 AI 辨識中，請稍候...")
     photo = update.message.photo[-1]
     file = await photo.get_file()
-    image_bytes = await file.download_as_bytearray()
+    photo_bytes = await file.download_as_bytearray()
+    name = gemini_recognize_name(bytes(photo_bytes))
 
-    candidates = analyze_image_with_gemini(bytes(image_bytes))
-
-    if candidates:
-        context.user_data["_gemini_candidates"] = candidates
-
-        if len(candidates) == 1:
-            # 只有一個候選，直接顯示確認
-            msg = f"AI 辨識結果：\n\n「{candidates[0]}」\n\n點選使用此名稱，或直接輸入修改後的名稱："
-        else:
-            # 多個候選，列出讓使用者選
-            msg = "AI 找到以下可能的餐廳名稱，請點選或直接輸入修改後的名稱："
-
-        # 把每個候選做成按鈕，最下方加略過和取消
-        rows = [[c] for c in candidates]
-        rows.append([BTN_SKIP, BTN_CANCEL])
-        keyboard = ReplyKeyboardMarkup(rows, one_time_keyboard=True, resize_keyboard=True)
-
-        await update.message.reply_text(msg, reply_markup=keyboard)
-        return ASK_NAME_CONFIRM
+    if name:
+        ctx.user_data["name"] = name
+        await update.message.reply_text(f"✅ 辨識結果：「{name}」\n\n若正確請繼續，若要修改請重新輸入文字。")
     else:
-        await update.message.reply_text(
-            "AI 無法從截圖中辨識餐廳名稱，請手動輸入：",
-            reply_markup=name_keyboard()
-        )
-        return ASK_NAME
+        await update.message.reply_text("⚠️ 無法辨識，請手動輸入餐廳名稱：")
+        await show_name(update, ctx)
+        return
 
+    await show_county(update, ctx)
 
-async def ask_name_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """使用者確認或修改 Gemini 建議的名稱"""
-    text = update.message.text.strip()
-
-    if text == BTN_CANCEL:
-        return await do_cancel(update, context)
-
-    candidates = context.user_data.get("_gemini_candidates", [])
-
-    if text == BTN_CANCEL:
-        return await do_cancel(update, context)
-    elif text in (BTN_SKIP, "略過"):
-        context.user_data["名稱"] = "未命名"
-    elif text in candidates:
-        # 使用者點選了某個候選名稱
-        context.user_data["名稱"] = text
-    elif text == BTN_CONFIRM and candidates:
-        # 相容舊的單一確認按鈕（只有一個候選時）
-        context.user_data["名稱"] = candidates[0]
-    else:
-        # 使用者手動輸入修改後的名稱
-        context.user_data["名稱"] = text
-
-    return await _load_notion_and_go_county(update, context)
-
-
-async def ask_county(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-
-    if text == BTN_CANCEL:
-        return await do_cancel(update, context)
-    if text == BTN_BACK:
-        await update.message.reply_text(
-            "請重新輸入餐廳名稱，或選擇下方選項：",
-            reply_markup=name_keyboard()
-        )
-        return ASK_NAME
-    if text == BTN_ADD_COUNTY:
-        await update.message.reply_text("請輸入新的縣市名稱：", reply_markup=ReplyKeyboardRemove())
-        return ASK_COUNTY_NEW
-
-    context.user_data["縣市"] = text
-    # 根據選擇的縣市，過濾對應的市區清單
-    context.user_data["_district_opts"] = get_districts_for_county(text)
-    return await _go_to_district(update, context)
-
-
-async def ask_county_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text == BTN_CANCEL:
-        return await do_cancel(update, context)
-    context.user_data["縣市"] = text
-    context.user_data["_district_opts"] = get_districts_for_county(text)
-    await update.message.reply_text(f"已新增縣市：{text}")
-    return await _go_to_district(update, context)
-
-
-async def _go_to_district(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    district_opts = context.user_data.get("_district_opts", [])
+# ── 指令 ─────────────────────────────────────────────────
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data.clear()
+    set_st(ctx, ST_WAIT_LINK)
+    load_options_from_notion()
     await update.message.reply_text(
-        "請選擇市區：",
-        reply_markup=district_keyboard(district_opts)
+        "👋 嗨！我是你的美食地圖收藏助手。\n\n"
+        "傳給我任何餐廳的連結：\n"
+        "• IG / Threads / 其他連結 → 直接填資料\n"
+        "• YouTube 連結 → 自動抓標題",
+        reply_markup=ReplyKeyboardRemove()
     )
-    return ASK_DISTRICT
 
+async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await do_cancel(update, ctx)
 
-async def ask_district(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    county_opts = context.user_data.get("_county_opts", [])
-
-    if text == BTN_CANCEL:
-        return await do_cancel(update, context)
-    if text == BTN_BACK:
-        await update.message.reply_text(
-            "請重新選擇縣市：",
-            reply_markup=county_keyboard(county_opts)
-        )
-        return ASK_COUNTY
-    if text == BTN_ADD_DISTRICT:
-        await update.message.reply_text("請輸入新的市區名稱：", reply_markup=ReplyKeyboardRemove())
-        return ASK_DISTRICT_NEW
-
-    context.user_data["市區"] = text
-    return await _go_to_type(update, context)
-
-
-async def ask_district_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text == BTN_CANCEL:
-        return await do_cancel(update, context)
-    context.user_data["市區"] = text
-    # 把新市區記錄到對應表，綁定到目前選擇的縣市
-    county = context.user_data.get("縣市", "")
-    if text and county:
-        DISTRICT_COUNTY_MAP[text] = county
-        # 同步更新 _district_opts，讓返回上一步時也能看到新選項
-        context.user_data["_district_opts"] = get_districts_for_county(county)
-    await update.message.reply_text(f"已新增市區：{text}（已歸類到 {county}）")
-    return await _go_to_type(update, context)
-
-
-async def _go_to_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["種類"] = []
-    type_opts = context.user_data.get("_type_opts", [])
-    await update.message.reply_text(
-        "請選擇料理種類（可多選）：",
-        reply_markup=type_keyboard(type_opts, has_selection=False)
-    )
-    return ASK_TYPE
-
-
-async def ask_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    type_opts     = context.user_data.get("_type_opts", [])
-    district_opts = context.user_data.get("_district_opts", [])
-    selected      = context.user_data.get("種類", [])
-
-    if text == BTN_CANCEL:
-        return await do_cancel(update, context)
-    if text == BTN_BACK:
-        await update.message.reply_text(
-            "請重新選擇市區：",
-            reply_markup=district_keyboard(district_opts)
-        )
-        return ASK_DISTRICT
-    if text == BTN_UNDO:
-        if selected:
-            removed = selected.pop()
-            context.user_data["種類"] = selected
-            already = "、".join(selected) if selected else "（尚無選擇）"
-            await update.message.reply_text(
-                f"已清除：{removed}\n目前已選：{already}",
-                reply_markup=type_keyboard(type_opts, has_selection=bool(selected))
-            )
-        else:
-            await update.message.reply_text(
-                "目前沒有已選的種類可以清除。",
-                reply_markup=type_keyboard(type_opts, has_selection=False)
-            )
-        return ASK_TYPE
-    if text == BTN_DONE:
-        if not selected:
-            await update.message.reply_text(
-                "至少選一個種類，或點「➕ 新增種類」手動輸入：",
-                reply_markup=type_keyboard(type_opts, has_selection=False)
-            )
-            return ASK_TYPE
-        await update.message.reply_text(
-            "請輸入營業時間\n（例如：11:30-21:00，週二公休）",
-            reply_markup=text_input_keyboard()
-        )
-        return ASK_HOURS
-    if text == BTN_ADD_TYPE:
-        await update.message.reply_text("請輸入新的種類名稱：", reply_markup=ReplyKeyboardRemove())
-        return ASK_TYPE_NEW
-    if text == PLACEHOLDER:
-        await update.message.reply_text(
-            "請選擇一個選項：",
-            reply_markup=type_keyboard(type_opts, has_selection=bool(selected))
-        )
-        return ASK_TYPE
-    if text in type_opts:
-        if text not in selected:
-            selected.append(text)
-            context.user_data["種類"] = selected
-        already = "、".join(selected)
-        await update.message.reply_text(
-            f"已選：{already}",
-            reply_markup=type_keyboard(type_opts, has_selection=True)
-        )
-        return ASK_TYPE
-
-    # 手動輸入（逗號分隔）
-    context.user_data["種類"] = [t.strip() for t in text.split(",") if t.strip()]
-    await update.message.reply_text(
-        "請輸入營業時間\n（例如：11:30-21:00，週二公休）",
-        reply_markup=text_input_keyboard()
-    )
-    return ASK_HOURS
-
-
-async def ask_type_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text == BTN_CANCEL:
-        return await do_cancel(update, context)
-    type_opts = context.user_data.get("_type_opts", [])
-    selected  = context.user_data.get("種類", [])
-    if text and text not in selected:
-        selected.append(text)
-        context.user_data["種類"] = selected
-    if text and text not in type_opts:
-        type_opts.append(text)
-        context.user_data["_type_opts"] = type_opts
-    already = "、".join(selected)
-    await update.message.reply_text(
-        f"已新增種類：{text}\n目前已選：{already}",
-        reply_markup=type_keyboard(type_opts, has_selection=True)
-    )
-    return ASK_TYPE
-
-
-async def ask_hours(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text == BTN_CANCEL:
-        return await do_cancel(update, context)
-    if text == BTN_BACK:
-        type_opts = context.user_data.get("_type_opts", [])
-        selected  = context.user_data.get("種類", [])
-        await update.message.reply_text(
-            "請重新選擇料理種類：",
-            reply_markup=type_keyboard(type_opts, has_selection=bool(selected))
-        )
-        return ASK_TYPE
-    context.user_data["營業時間"] = "" if text in (BTN_SKIP, "略過") else text
-    await update.message.reply_text(
-        "請輸入餐廳特色\n（例如：老宅改造、必點牛舌定食）",
-        reply_markup=text_input_keyboard()
-    )
-    return ASK_FEATURE
-
-
-async def ask_feature(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text == BTN_CANCEL:
-        return await do_cancel(update, context)
-    if text == BTN_BACK:
-        await update.message.reply_text(
-            "請重新輸入營業時間：",
-            reply_markup=text_input_keyboard()
-        )
-        return ASK_HOURS
-    context.user_data["特色"] = "" if text in (BTN_SKIP, "略過") else text
-    await update.message.reply_text(
-        "請輸入你的評價或備忘\n（例如：強烈推薦！下次還要去）",
-        reply_markup=text_input_keyboard()
-    )
-    return ASK_RATING
-
-
-async def ask_rating(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text == BTN_CANCEL:
-        return await do_cancel(update, context)
-    if text == BTN_BACK:
-        await update.message.reply_text(
-            "請重新輸入餐廳特色：",
-            reply_markup=text_input_keyboard()
-        )
-        return ASK_FEATURE
-    context.user_data["評價"] = "" if text in (BTN_SKIP, "略過") else text
-
-    if context.user_data.get("連結"):
-        return await _show_confirm(update, context)
-
-    await update.message.reply_text(
-        "請貼上相關連結\n（Google Maps / 食記 / YouTube 皆可）",
-        reply_markup=text_input_keyboard()
-    )
-    return ASK_URL
-
-
-async def ask_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text == BTN_CANCEL:
-        return await do_cancel(update, context)
-    if text == BTN_BACK:
-        await update.message.reply_text(
-            "請重新輸入評價：",
-            reply_markup=text_input_keyboard()
-        )
-        return ASK_RATING
-    context.user_data["連結"] = "" if text in (BTN_SKIP, "略過") else text
-    return await _show_confirm(update, context)
-
-
-async def _show_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    d = context.user_data
-    types_str = "、".join(d.get("種類", [])) or "（未填）"
-    summary = (
-        "請確認以下資訊：\n\n"
-        f"名稱：{d.get('名稱', '')}\n"
-        f"位置：{d.get('縣市', '')} {d.get('市區', '')}\n"
-        f"種類：{types_str}\n"
-        f"營業：{d.get('營業時間', '') or '（未填）'}\n"
-        f"特色：{d.get('特色', '') or '（未填）'}\n"
-        f"評價：{d.get('評價', '') or '（未填）'}\n"
-        f"連結：{d.get('連結', '') or '（未填）'}"
-    )
-    await update.message.reply_text(summary, reply_markup=confirm_keyboard())
-    return CONFIRM
-
-
-async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-
-    if text == BTN_CANCEL:
-        return await do_cancel(update, context)
-    if text == BTN_BACK:
-        if context.user_data.get("連結"):
-            await update.message.reply_text(
-                "請重新輸入評價：",
-                reply_markup=text_input_keyboard()
-            )
-            return ASK_RATING
-        else:
-            await update.message.reply_text(
-                "請重新輸入連結：",
-                reply_markup=text_input_keyboard()
-            )
-            return ASK_URL
-    if text == BTN_CONFIRM:
-        ok = save_to_notion(context.user_data)
-        if ok:
-            await update.message.reply_text(
-                "已成功儲存到「敏的美食地圖」！\n\n下次直接傳連結即可繼續收藏。",
-                reply_markup=ReplyKeyboardRemove()
-            )
-        else:
-            await update.message.reply_text(
-                "寫入 Notion 失敗，請確認 Integration 已連接資料庫。\n傳 /start 重試。",
-                reply_markup=ReplyKeyboardRemove()
-            )
-        context.user_data.clear()
-        return ConversationHandler.END
-
-    await update.message.reply_text("請點選上方按鈕操作。", reply_markup=confirm_keyboard())
-    return CONFIRM
-
-
-async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    return await do_cancel(update, context)
-
-# ── 主程式 ────────────────────────────────────────────────
 def main():
+    load_options_from_notion()
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-
-    conv = ConversationHandler(
-        entry_points=[
-            CommandHandler("start", start),
-            MessageHandler(filters.TEXT & filters.Regex(r"https?://") & ~filters.COMMAND, receive_url_direct),
-        ],
-        states={
-            ASK_NAME:         [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_name)],
-            ASK_NAME_PHOTO:   [
-                MessageHandler(filters.PHOTO, ask_name_photo),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, ask_name_photo),
-            ],
-            ASK_NAME_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_name_confirm)],
-            ASK_COUNTY:       [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_county)],
-            ASK_COUNTY_NEW:   [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_county_new)],
-            ASK_DISTRICT:     [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_district)],
-            ASK_DISTRICT_NEW: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_district_new)],
-            ASK_TYPE:         [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_type)],
-            ASK_TYPE_NEW:     [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_type_new)],
-            ASK_HOURS:        [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_hours)],
-            ASK_FEATURE:      [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_feature)],
-            ASK_RATING:       [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_rating)],
-            ASK_URL:          [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_url)],
-            CONFIRM:          [MessageHandler(filters.TEXT & ~filters.COMMAND, confirm)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_command)],
-        allow_reentry=True,
-    )
-
-    app.add_handler(conv)
-    logger.info("敏的美食地圖 Bot 啟動中...")
-    app.run_polling()
-
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    logger.info("Bot v15 starting...")
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
